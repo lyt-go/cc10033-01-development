@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
 from app.routers import ROUTERS
+from app.services.attempt_receipt import attempt_receipt_service
 from app.store import store
 
 app = FastAPI(title="分布式采集调度与反封锁平台", version="1.0.0")
@@ -21,6 +22,13 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.on_event("startup")
+def recover_attempt_state() -> None:
+    """进程重启后补偿未完成的任务详情/调度计划投影。"""
+    attempt_receipt_service.recover_all()
+
 
 @app.get("/api/health")
 def health() -> dict[str, object]:

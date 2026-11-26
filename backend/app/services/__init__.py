@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from app.services.base import BaseModuleService
+from app.services.attempt_resource import AttemptReceiptResourceService, AttemptResourceService
 from app.services.crawl_mission import CrawlMissionService
 from app.services.proxy_node import ProxyNodeService
 from app.services.rate_limit import RateLimitService
@@ -43,5 +44,15 @@ SERVICES: dict[str, BaseModuleService] = {
 }
 
 
+_ATTEMPT_RESOURCE = AttemptResourceService()
+_ATTEMPT_RECEIPT_RESOURCE = AttemptReceiptResourceService()
+_SERVICE_ALIASES = {
+    "attempt": _ATTEMPT_RESOURCE,
+    "attempts": _ATTEMPT_RESOURCE,
+    "attempt_receipt": _ATTEMPT_RECEIPT_RESOURCE,
+    "attempt_receipts": _ATTEMPT_RECEIPT_RESOURCE,
+}
+
+
 def service_for(module: str) -> BaseModuleService | None:
-    return SERVICES.get(module)
+    return SERVICES.get(module) or _SERVICE_ALIASES.get(module)

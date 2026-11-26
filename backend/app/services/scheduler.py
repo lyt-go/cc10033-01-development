@@ -11,6 +11,7 @@ import random
 import time
 from typing import Any
 
+from app.services.attempt_receipt import attempt_receipt_service
 from app.services.base import BaseModuleService
 from app.store import store
 
@@ -25,6 +26,30 @@ class SchedulerService(BaseModuleService):
     ACTION_RULES = {"提交验证": "待验证", "启动计划": "运行中", "暂停计划": "已暂停"}
 
     STRATEGIES = ["round_robin", "priority_first", "earliest_deadline", "shortest_job", "resource_aware"]
+
+    def get_entry(self, entry_id: int) -> dict[str, Any] | None:
+        entry = super().get_entry(entry_id)
+        if entry is None:
+            attempt_receipt_service.restore_entities()
+            entry = super().get_entry(entry_id)
+        if entry is None:
+            return None
+        attempt_receipt_service.recover_for_plan(entry_id)
+        entry["attempts"] = attempt_receipt_service.list_attempts(plan_id=entry_id)
+        entry["_attempts"] = entry["attempts"]
+        entry["_attempt_history"] = entry["attempts"]
+        entry["dispatch_count"] = int(entry.get("dispatch_count", entry.get("_dispatch_count", 0)))
+        entry["dispatch_times"] = entry["dispatch_count"]
+        entry["total_dispatched"] = int(entry.get("_total_dispatched", 0))
+        entry["dispatch_todos"] = attempt_receipt_service.list_todos(entry_id)["items"]
+        entry["_dispatch_todos"] = entry["dispatch_todos"]
+        entry["scheduler_todos"] = entry["dispatch_todos"]
+        entry["_scheduler_todos"] = entry["dispatch_todos"]
+        entry["todos"] = entry["dispatch_todos"]
+        entry["redispatchable_items"] = attempt_receipt_service.list_redispatchable(plan_id=entry_id)
+        entry["redispatchable"] = entry["redispatchable_items"]
+        entry["redispatch_history"] = attempt_receipt_service.redispatch_history(plan_id=entry_id)
+        return entry
 
     def create_entry(self, values: dict[str, Any]) -> tuple:
         entry, missing = super().create_entry(values)
@@ -58,7 +83,7 @@ class SchedulerService(BaseModuleService):
         return entry
 
     def dispatch_next(self, entry_id: int) -> dict[str, Any] | None:
-        """按优先调度下一个任务。"""
+        """按优先调度下一个任务，并生成可用于回报的尝试编号。"""
         entry = store.find(self.MODULE, entry_id)
         if entry is None or not entry["_task_queue"]:
             return None
@@ -71,29 +96,138 @@ class SchedulerService(BaseModuleService):
             store.record_metric("scheduler", "dispatch_blocked_concurrency", 1,
                                 {"active": str(active), "limit": str(max_concurrent)})
             return None
-        entry["_active_tasks"] = active + 1
-        entry["_execution_history"].append({
-            "mission_id": next_task["mission_id"],
-            "dispatched_at": time.time(),
-            "priority": next_task["priority"],
-        })
-        store.record_metric("scheduler", "mission_dispatched", 1,
-                            {"mission_id": str(next_task["mission_id"])})
-        return next_task
 
-    def report_completion(self, entry_id: int, mission_id: int, success: bool) -> None:
-        """任务完成回执。"""
+        mission_id = next_task["mission_id"]
+        attempt = attempt_receipt_service.claim_attempt(
+            mission_id,
+            entry_id,
+            priority=next_task.get("priority"),
+            reason="redispatch" if next_task.get("redispatch_of_attempt_id") else "dispatch",
+            redispatch_of_attempt_id=next_task.get("redispatch_of_attempt_id"),
+            increment_active=True,
+            _total_already_counted=True,
+        )
+        # claim_attempt 已追加历史；这里保留旧版调度历史的指标语义。
+        store.record_metric("scheduler", "mission_dispatched", 1,
+                            {"mission_id": str(mission_id), "attempt_id": str(attempt["id"])})
+        result = dict(next_task)
+        result.update(attempt)
+        result["mission_id"] = mission_id
+        return result
+
+    def claim_next(self, entry_id: int) -> dict[str, Any] | None:
+        """dispatch_next 的语义别名：领取下一个可执行尝试。"""
+        return self.dispatch_next(entry_id)
+
+    def claim_attempt(self, entry_id: int, mission_id: int, **kwargs: Any) -> dict[str, Any]:
+        return attempt_receipt_service.claim_attempt(mission_id, entry_id, **kwargs)
+
+    claim_next_attempt = claim_next
+    claim_work = claim_next
+
+    def report_attempt(
+        self,
+        entry_id: int,
+        attempt_id: int | str,
+        success: Any = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        if "plan_id" not in kwargs:
+            kwargs["plan_id"] = entry_id
+        return attempt_receipt_service.submit_receipt(attempt_id, success=success, **kwargs)
+
+    def report_completion(
+        self,
+        entry_id: int,
+        mission_id: int,
+        success: bool,
+        attempt_id: int | str | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any] | None:
+        """任务完成回执；同一尝试的重复回报由尝试服务幂等处理。"""
         entry = store.find(self.MODULE, entry_id)
         if entry is None:
-            return
-        entry["_active_tasks"] = max(0, entry.get("_active_tasks", 0) - 1)
-        if not success:
-            entry["_failed_dispatch"] += 1
+            return None
+        if attempt_id is None:
+            attempt_id = entry.get("_current_attempt_id") or \
+                attempt_receipt_service.latest_attempt_id(mission_id)
+        if attempt_id is None:
+            # 兼容没有显式领取尝试的旧调用：补建第一次尝试。
+            attempt = attempt_receipt_service.claim_attempt(mission_id, entry_id)
+            attempt_id = attempt["id"]
+
+        result = attempt_receipt_service.submit_receipt(
+            attempt_id,
+            mission_id=mission_id,
+            success=success,
+            **kwargs,
+        )
+        # 旧契约：失败策略为 retry 时入队。新服务已在回执中幂等写入重派决定，
+        # 这里仅做兼容补偿；重复回报不会再次入队。
+        if success is False and not result.get("duplicate"):
             fail_strategy = entry.get("失败策略", "retry")
             if fail_strategy == "retry":
-                self.enqueue_mission(entry_id, mission_id, priority=0)
+                attempt_receipt_service._create_redispatch_decision_locked(  # noqa: SLF001
+                    attempt_receipt_service._state["attempts"][  # noqa: SLF001
+                        attempt_receipt_service._find_index_locked(attempt_id, mission_id)  # noqa: SLF001
+                    ],
+                    enqueue=True,
+                )
+                attempt_receipt_service._persist_locked()  # noqa: SLF001
                 store.record_metric("scheduler", "mission_requeued_for_retry", 1,
                                     {"mission_id": str(mission_id)})
+        return result
+
+    def list_attempts(self, entry_id: int) -> list[dict[str, Any]]:
+        return attempt_receipt_service.list_attempts(plan_id=entry_id)
+
+    def list_todos(self, entry_id: int) -> dict[str, Any]:
+        return attempt_receipt_service.list_todos(entry_id)
+
+    def scheduler_todos(self, entry_id: int) -> dict[str, Any]:
+        return self.list_todos(entry_id)
+
+    def list_redispatchable(self, entry_id: int | None = None) -> list[dict[str, Any]]:
+        return attempt_receipt_service.list_redispatchable(plan_id=entry_id)
+
+    def get_redispatch_items(self, entry_id: int | None = None) -> list[dict[str, Any]]:
+        return self.list_redispatchable(entry_id)
+
+    def poll_redispatchable(self, entry_id: int | None = None) -> list[dict[str, Any]]:
+        return self.list_redispatchable(entry_id)
+
+    def redispatch_queue(self, entry_id: int | None = None) -> list[dict[str, Any]]:
+        return self.list_redispatchable(entry_id)
+
+    def redispatch_next(self, entry_id: int) -> dict[str, Any] | None:
+        return attempt_receipt_service.redispatch_next(entry_id)
+
+    def recover_attempts(self, entry_id: int | None = None) -> dict[str, Any]:
+        if entry_id is None:
+            return attempt_receipt_service.recover_all()
+        return {"items": attempt_receipt_service.recover_for_plan(entry_id)}
+
+    def run_action(self, entry_id: int, action: str) -> tuple[dict[str, Any] | None, str]:
+        entry = store.find(self.MODULE, entry_id)
+        if entry is None:
+            return None, f"{self.ENTITY} {entry_id} 不存在或已归档"
+        if action in {"派发下一项", "领取下一项", "派发并领取尝试编号"}:
+            task = self.dispatch_next(entry_id)
+            if task is None:
+                return entry, "调度队列为空或并发上限已满"
+            return entry, f"已派发，尝试编号 {task.get('attempt_id')}"
+        if action in {"重派下一项", "查询可重派项并重派", "重派"}:
+            result = self.redispatch_next(entry_id)
+            if result is None:
+                return entry, "当前没有可重派项"
+            return entry, result.get("message", "已重派")
+        if action in {"登记成功", "登记失败"}:
+            attempt_id = entry.get("_current_attempt_id")
+            if attempt_id is None:
+                return entry, "当前没有可回报的尝试"
+            result = self.report_attempt(entry_id, attempt_id, action == "登记成功")
+            return entry, result["message"]
+        return super().run_action(entry_id, action)
 
     def predict_load(self, entry_id: int) -> dict[str, Any]:
         """预测未来负载，供弹性伸缩决策。跨模块：scheduler → scalable_pool"""

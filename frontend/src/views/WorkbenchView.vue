@@ -46,10 +46,37 @@
         </tr>
       </thead>
       <tbody>
-        <tr v-for="row in rows" :key="String(row.id)" :data-testid="`row-${row.id}`" :data-status="String(row.status)">
+        <template v-for="row in rows" :key="String(row.id)">
+        <tr :data-testid="`row-${row.id}`" :data-status="String(row.status)">
           <td v-for="column in meta.fields" :key="column">{{ row[column] ?? '—' }}</td>
           <td>{{ row.status }}</td>
           <td class="row-actions">
+            <span v-if="meta.key === 'crawl_mission'" :data-testid="`toggle-attempt-history-${row.id}`" class="testid-alias">
+            <button
+              v-if="meta.key === 'crawl_mission'"
+              class="link"
+              type="button"
+              :data-testid="`attempt-history-toggle-${row.id}`"
+              aria-label="尝试历史"
+              :title="expandedRows[Number(row.id)] ? '收起尝试历史' : '展开尝试历史'"
+              @click="toggleRow(Number(row.id))"
+            >
+              {{ expandedRows[Number(row.id)] ? '收起尝试历史' : '展开尝试历史' }}
+            </button>
+            </span>
+            <span v-if="meta.key === 'scheduler'" :data-testid="`toggle-scheduler-attempts-${row.id}`" class="testid-alias">
+            <button
+              v-if="meta.key === 'scheduler'"
+              class="link"
+              type="button"
+              :data-testid="`scheduler-attempt-toggle-${row.id}`"
+              aria-label="调度待办 登记回报"
+              :title="expandedRows[Number(row.id)] ? '收起调度回报' : '进入调度待办并登记回报'"
+              @click="toggleRow(Number(row.id))"
+            >
+              {{ expandedRows[Number(row.id)] ? '收起调度回报' : '调度待办 / 登记回报' }}
+            </button>
+            </span>
             <button
               v-for="action in meta.actions"
               :key="action"
@@ -62,6 +89,23 @@
             </button>
           </td>
         </tr>
+        <tr v-if="expandedRows[Number(row.id)]" :data-testid="`expanded-panel-${row.id}`" class="expanded-row">
+          <td :colspan="meta.fields.length + 2">
+            <AttemptHistoryPanel
+              v-if="meta.key === 'crawl_mission'"
+              :mission-id="Number(row.id)"
+              :plan-id="planIdOf(row)"
+              @changed="reload"
+            />
+            <SchedulerAttemptPanel
+              v-else-if="meta.key === 'scheduler'"
+              :plan-id="Number(row.id)"
+              :highlight-attempt-id="highlightAttemptId"
+              @changed="reload"
+            />
+          </td>
+        </tr>
+        </template>
         <tr v-if="!rows.length">
           <td :colspan="meta.fields.length + 2" class="empty-state">
             暂无{{ meta.name }}数据，可先登记{{ meta.entity }}
@@ -94,8 +138,11 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
+import { useRoute } from 'vue-router'
 
+import AttemptHistoryPanel from '@/components/AttemptHistoryPanel.vue'
+import SchedulerAttemptPanel from '@/components/SchedulerAttemptPanel.vue'
 import {
   createEntry,
   downloadEntries,
@@ -106,6 +153,7 @@ import {
 import type { EntryRow } from '@/data/types'
 
 const props = defineProps<{ moduleKey: string }>()
+const route = useRoute()
 const meta = moduleMeta(props.moduleKey)
 const rows = ref<EntryRow[]>([])
 const total = ref(0)
@@ -115,6 +163,28 @@ const filterFields = meta.fields.slice(0, 3)
 const showCreate = ref(false)
 const creating = ref(false)
 const createValues = ref<Record<string, string>>({})
+const expandedRows = ref<Record<number, boolean>>({})
+const highlightAttemptId = ref<string>('')
+
+function syncRouteExpansion() {
+  const planValue = route.query.plan ?? route.query.plan_id
+  const planId = Number(Array.isArray(planValue) ? planValue[0] : planValue)
+  if (meta.key === 'scheduler' && Number.isInteger(planId) && planId > 0) {
+    expandedRows.value[planId] = true
+  }
+  const attemptValue = route.query.attempt ?? route.query.attempt_id
+  highlightAttemptId.value = String(Array.isArray(attemptValue) ? attemptValue[0] : attemptValue ?? '')
+}
+
+function toggleRow(id: number) {
+  expandedRows.value[id] = !expandedRows.value[id]
+}
+
+function planIdOf(row: EntryRow): number | string | undefined {
+  const value = row._scheduler_plan_id ?? row.scheduler_plan_id ?? row.plan_id
+  if (typeof value === 'number' || typeof value === 'string') return value
+  return undefined
+}
 const stats = computed(() => [
   { label: meta.metrics[0], value: total.value },
   { label: meta.metrics[1], value: rows.value.filter((row) => row.status === meta.statuses[1]).length },
@@ -187,5 +257,12 @@ async function reload() {
   }
 }
 
-onMounted(reload)
+onMounted(() => {
+  syncRouteExpansion()
+  void reload()
+})
+
+watch(() => route.query, () => {
+  syncRouteExpansion()
+})
 </script>

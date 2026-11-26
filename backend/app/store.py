@@ -106,6 +106,16 @@ class Store:
     def pending_events(self) -> int:
         return len(self._event_queue)
 
+    # ── 尝试回执恢复入口 ─────────────────────────
+
+    def recover_attempts(self) -> dict[str, Any]:
+        """重启后恢复尝试回执/重派投影；延迟导入避免循环依赖。"""
+        from app.services.attempt_receipt import attempt_receipt_service
+        return attempt_receipt_service.recover_all()
+
+    def recover(self) -> dict[str, Any]:
+        return self.recover_attempts()
+
     # ── 拓扑概览 ──────────────────────────────
 
     def get_pipeline_topology(self) -> dict[str, list[str]]:
